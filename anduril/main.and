@@ -1,0 +1,972 @@
+title = "ETV6-RUNX1 Veronika REH Knockdown & Helena NALM6 Overexpression"
+shortName = "ER_Veronika_KD_Helena_OE"
+authors = "Christian Frech and Marko Laakso"
+
+//------------------------------------------------------------------------------------------------
+//--- INPUT DATA
+//------------------------------------------------------------------------------------------------
+
+inputBamDir       = INPUT(path="/mnt/projects/helena_veronika/data/bam", recursive=false)
+inputSamples      = INPUT(path="/mnt/projects/helena_veronika/data/sample_key.csv")
+inputSampleGroups = INPUT(path="/mnt/projects/helena_veronika/data/sample_groups.csv")
+inputComparisons  = INPUT(path="/mnt/projects/helena_veronika/data/comparisons.csv")
+gtf               = INPUT(path="/mnt/projects/helena_veronika/data/Homo_sapiens.GRCh37.75.etv6runx1.gtf.gz")
+gtfNorRNA         = INPUT(path="/mnt/projects/helena_veronika/data/Homo_sapiens.GRCh37.75.etv6runx1.norRNA.gtf.gz")
+geneAnnot         = INPUT(path="/mnt/projects/helena_veronika/data/ensembl.homo_sapiens_75_37.geneAnnotations.tsv") // downloaded via Ensembl biomart http://feb2014.archive.ensembl.org/biomart/martview/b57730c5d3013cd648bcd2c966113d42
+geneGO            = INPUT(path="/opt/moksiskaan/pipeline/exec/output/geneGO_9606.csv")                              // Gene Ontology annotations of all genes; comes with anduril-moksiskaan Docker image
+enrichmentTable   = INPUT(path="/opt/moksiskaan/pipeline/exec/output/GOEnrichment_9606.csv")                        // Moksiskaan specific a priori probabilities for the Gene ontology terms; comes with anduril-moksiskaan Docker image
+ensemblDb         = INPUT(path="/usr/local/share/anduril-bundles/moksiskaan/etc/ensemblHomoSapiens.properties")     // JDBC parameters for Ensembl~\cite{Flicek2008} database; comes with anduril-moksiskaan Docker image
+genesetAnnotation = INPUT(path="/mnt/projects/helena_veronika/data/geneset_annotation.tsv")                         // assigns gene sets to categories for filtering
+
+//------------------------------------------------------------------------------------------------
+//--- CONSTANTS
+//------------------------------------------------------------------------------------------------
+
+fcLimitInclude  = 0.8    // minimum fold-change for a differentially expressed gene
+pLimitInclude   = 1e-5    // minimum p-value to call a gene significantly differentially expressed
+qLimitInclude   = 1e-3    // minimum adjusted p-value to call a gene significantly differentially expressed
+minExprInclude  = 100.00  // minimum normalized expression level in either of the two compared groups to call a gene differentially expressed
+maxNA    		= 0.90    // fraction of samples allowed to have NA values before gene is discarded
+pGOEnrich       = 0.01    // minimum p-value to call a GO term enriched 
+
+hyperlinkRuleEnsemblGeneCards = StringInput(content=
+	"URL\trefCol\tvalueCol\n" +
+	"http://www.ensembl.org/id/$ID$\tEnsembl\tEnsembl\n" +
+	"http://www.genecards.org/cgi-bin/carddisp.pl?gene=$ID$\tGene\tGene\n"
+)
+
+//------------------------------------------------------------------------------------------------
+//--- PRE-PROCESSING OF INPUT DATA
+//------------------------------------------------------------------------------------------------
+
+inputBamFiles = Folder2Array(folder1 = inputBamDir, filePattern = "^([^_]+)_.*[.]bam$")
+moksiskaanInit = MoksiskaanInit(showLog='EnsemblImport,PathwayCommonsImport,PINAImport,WikiPathways')
+ensemblRef = XrefLinkRule(moksiskaan = moksiskaanInit.connection, columns = "Ensembl=Ensembl", xrefTypes  = XrefType_Ensembl_gene)
+
+//------------------------------------------------------------------------------------------------
+//--- SAMPLES
+//------------------------------------------------------------------------------------------------
+
+samples = record()
+for entry : std.itercsv(inputSamples) 
+{
+	samples[""+entry.ID] =
+	{
+		'alias' = entry.Alias,
+		'description' = entry.Description
+	}
+}
+std.echo(samples["29309"])
+
+//------------------------------------------------------------------------------------------------
+//--- SAMPLE GROUPS
+//------------------------------------------------------------------------------------------------
+
+sampleGroups = TableQuery
+(
+	table1 = inputSampleGroups @require,
+	query  = '''SELECT * FROM table1 ORDER BY "ID"'''
+)
+
+//------------------------------------------------------------------------------------------------
+//--- COMPARISONS
+//------------------------------------------------------------------------------------------------
+
+comparisons = record()
+for comparison : std.itercsv(inputComparisons) 
+{
+	// fetch group names
+	gCase    = null
+	gControl = null
+	for g : std.split(comparison.Members, ',')
+	{
+		if (gCase    == null) { gCase    = g } else
+		if (gControl == null) { gControl = g } else
+		std.fail("Too many groups listed for ", comparison.ID, " (", comparison.Description, "). Members = ", comparison.Members, sep='')
+	}
+
+	sampleIdLst = CSV2IDList
+	(
+		table1    = sampleGroups @require,
+		columnIn  = "Members",
+		columnOut = "Sample",
+		isList    = true,
+		regexp1   = "ID=(" + gCase + "|" + gControl + ")",
+		@name     = "sampleIds_" + comparison.ID
+	)
+
+	// add group record	
+	comparisons[comparison.ID] = 
+	{
+		'caseG'       = gCase,
+		'controlG'    = gControl,
+		'addG'        = comparison.NonMembers,
+		'sampleIdLst' = sampleIdLst.ids,
+		'sampleIds'   = std.strReplace(std.fRead(sampleIdLst.ids), "\n", ",", "^[^,]+,(.*)", "$1", ",$", ""),
+		'desc'        = comparison.Description
+	}
+}
+
+//------------------------------------------------------------------------------------------------
+//--- EXPERIMENTAL SETUP REPORT
+//------------------------------------------------------------------------------------------------
+
+include "/mnt/projects/iamp/scripts/anduril/experimentalSetup.and"
+
+experimentReport = experimentalSetupReport
+(
+	samples      = inputSamples,
+	sampleGroups = sampleGroups,
+	comparisons  = inputComparisons,
+	sampleTableColumns = "ID,Alias,Plex,Description,RNA_by,File",
+	sampleTableFormat  = "ccclcl"
+)
+
+//------------------------------------------------------------------------------------------------
+//--- ALIGNMENT
+//------------------------------------------------------------------------------------------------
+
+alignedBams = record()
+for bam : std.iterArray(inputBamFiles) 
+{
+	@out.alignment.filename = bam.key + '.gsnap.sorted.dupmarked.bam'
+	gsnap = GSNAP
+	(
+		reads    = INPUT(path=bam.file), 
+		options  = "--db=g1k_v37_etv6runx1 --dir=/data_synology/anduril/docker-images/anduril-gsnap_2014_12_28-human_g1k_v37/db/human_g1k_v37 --use-splicing=g1k_v37.splicesites --use-snps=g1k_v37.snp138 --nthreads 15 --maxsearch=100 --npaths=1 --max-mismatches=1 --novelsplicing=0 --batch=4 --genome-unk-mismatch=0",
+		docker   = "biowaste:5000/anduril/gsnap",
+		@cpu     = 10, 
+		@memory  = 40000,
+		@name    = "gsnap_" + bam.key,
+		@execute = "once" 
+	)
+	alias = samples[bam.key+""].alias
+	alignedBams[alias] = gsnap.alignment
+}
+
+//------------------------------------------------------------------------------------------------
+//--- EXPRESSION MATRIX
+//------------------------------------------------------------------------------------------------
+
+bamCounts  = {}
+for sample, bam : alignedBams 
+{
+	@out.optOut1.filename = sample + '.htseq.counts'
+	count = BashEvaluate
+	(
+		var1 = bam,
+		var2 = gtfNorRNA,
+		script = "htseq-count -f bam -t exon -s no @var1@ @var2@ | grep -v '^__' > @optOut1@",
+		@name = "htseq_" + sample
+	)
+	bamCounts[sample] = count.optOut1
+}
+
+deseqExprMatrix = DESeqExpr
+(
+	geneCounts  = bamCounts,
+    counts      = false,
+    maxNA       = 0.9,
+    normalized  = true
+)
+
+//------------------------------------------------------------------------------------------------
+//--- QUALITY CONTROL
+//------------------------------------------------------------------------------------------------
+
+include "/mnt/projects/iamp/scripts/anduril/qc.and"
+
+qcReport  = getQCReport
+(
+	alignedBAMs = alignedBams,
+    gtf = gtf,
+    counts = bamCounts,
+    force expr   = deseqExprMatrix.expr,
+    force groups = sampleGroups,
+    readStatsSamplesPerRow = 5,
+    readStatsYMax = 110
+)
+
+nvcs = record()
+for sample, bam : alignedBams 
+{
+	//@out.optOut1.filename = sample + '.rseqc.htseq.counts'
+	nvc = BashEvaluate
+	(
+		var1 = bam,
+		param1 = sample,
+		echoStdOut = true,
+		script = """
+			set -ex
+			docker pull biowaste:5000/anduril/rseqc && \
+				docker run --volumes-from anduril-master --workdir=$(dirname @optOut1@) biowaste:5000/anduril/rseqc \
+					"read_NVC.py -x -q 30 -i <(samtools view -hbs 815.1 @var1@) -o @param1@"
+			grep -P '(A_count|T_count|G_count|C_count|N_count|X_count|total|position)=' ${parameter_param1}.NVC_plot.r > ${parameter_param1}.NVC_data.r
+			R --vanilla --slave -e 'source("'${parameter_param1}.NVC_data.r'"); df <- data.frame(sample=@param1@, A=A_count/total, C=C_count/total, G=G_count/total, T=T_count/total, N=N_count/total, X=X_count/total, cycle=position); library(reshape2); long <- melt(df, id.vars=c("sample", "cycle")); names(long)[3:4] <- c("nucleotide", "freq"); write.table(long, file=@optOut1@, col.names=T, row.names=F, quote=F, sep="\\t")'
+		""",
+		@name = "rseqc_nvc_" + sample
+	)
+	nvcs[sample] = nvc.optOut1
+}
+
+nvcsAllSamples = CSVJoin
+(
+	array   = nvcs,
+	useKeys = false
+)
+
+nvcPlot = REvaluate
+(
+	table1 = nvcsAllSamples.csv,
+	param1 = "NVC plot",
+	param2 = "subsection",
+	script = StringInput(content=
+		'''
+		# debugging
+		#library(componentSkeleton)
+		#rm(list=ls()) ; cf <- parse.command.file("/mnt/projects/helena_veronika/results/anduril/execute/nvcPlot/_command")
+		
+		# read data and parameters
+		instance.name <- get.metadata(cf, 'instanceName')	
+		data <- CSV.read(get.input(cf, 'table1'))
+		section.title <- get.parameter(cf, 'param1', type = 'string')
+		section.type <- get.parameter(cf, 'param2', type = 'string')
+					
+		# lattice plot
+		document.dir <- get.output(cf, 'document')
+		plot.file <- sprintf('NVC_%s.pdf', instance.name)
+		pdf(file.path(document.dir, plot.file))
+		library(lattice)
+		data$sample <- as.factor(as.character(data$sample))
+		p <- xyplot(freq~cycle|sample, 
+ 		       group=nucleotide, 
+		       data=data[data$nucleotide!="X",], 
+		       type=c("l", "g"),
+		       as.table=TRUE,
+		       col=c("dark green","cyan","blue","black","orange"),
+		       key=list(space="top",
+		               lines=list(col=c("dark green","orange","blue","cyan","black"), lwd=2),
+		               text=list(c("A","T","G","C","N")),
+		               columns=5))
+		print(p)
+		dev.off()
+
+		# prepare latex document
+		tex <- character()
+		tex <- c(tex, '\\clearpage')
+		if (nchar(section.type) > 0) {
+  			section.type=paste('\\',section.type,sep='') # if section type is defined, add escape in the beginning
+		}
+		if (nchar(section.title) > 0) {
+  			tex <- c(tex, sprintf('%s{%s}\\label{%s}', section.type, section.title,	instance.name))
+		}			
+		tex <- c(tex, latex.figure(plot.file, image.height=16, caption="Nucleotide vs. cycle (NVC) plots for each sample."))		    			    
+		document.out <- tex
+
+		# finish up
+		table.out <- data.frame() # not used
+		return(0)
+		''')
+)
+
+//------------------------------------------------------------------------------------------------
+//--- DIFFERENTIAL GENE EXPRESSION ANALYSIS
+//------------------------------------------------------------------------------------------------
+
+gMoksisA = PiispanhiippaAnnotator(sourceKeys = deseqExprMatrix.expr @require,
+                                  connection = moksiskaanInit.connection,
+                                  inputDB    = XrefType_Ensembl_gene,
+                                  organism   = Organism_Homo_sapiens,
+                                  targetDB   = "BioentityName,DNARegion")
+
+geneNames = CSVCleaner(original   = gMoksisA.bioAnnotation,
+                       columns    = "sourceKey,BioentityName,DNARegion",
+                       rename     = "sourceKey=Ensembl,BioentityName=Gene",
+                       skipQuotes = "*",
+                       trim       = true,
+                       @keep      = true)
+
+
+degAllLst  = record()        // unfiltered output of DESeq2 for each comparison
+degCalledLst  = record()     // only significant DEGs for each comparison
+
+// compute differential expression statistics with DESeq2
+
+for ID, comparison : comparisons
+{
+	deseq = DESeq2
+	(
+		countFiles              = bamCounts,
+		samples                 = sampleGroups,
+	    nameControl             = comparison.controlG,
+	    nameCase                = comparison.caseG,
+	    additionalGroups        = comparison.addG,
+	    label                   = ID,
+	    minReplicatesForReplace = 7,
+	    @name                   = "deseq_" + ID
+	)
+	degAllLst[ID] = deseq.results
+		
+	// subset statistically significant DEGs
+	degCalled = TableQuery
+	(
+		table1 = deseq @require,
+		query  = 
+			"""
+			SELECT DISTINCT "ids"                 AS "ids", 
+			                "fc"""+ID+""""        AS "fc", 
+			                "meanExprE"""+ID+"""" AS "meanExprE", 
+			                "meanExprC"""+ID+"""" AS "meanExprC", 
+			                "p"""+ID+""""         AS "p", 
+			                "q"""+ID+""""         AS "q" 
+			FROM   table1
+				WHERE  (ABS("fc"""+ID+"""")    >= """ + fcLimitInclude + """) AND
+					   ("p"""+ID+""""          <= """ + pLimitInclude  + """) AND
+					   ("q"""+ID+""""          <= """ + qLimitInclude  + """) AND
+					   (("meanExprE"""+ID+"""" >= """ + minExprInclude + """) OR
+					   ("meanExprC"""+ID+""""  >= """ + minExprInclude + """))
+					   ORDER  BY 1
+			""",
+			@name  = "degCalled_"+ID
+	)
+	degCalledLst[ID] = degCalled.table
+}
+
+//------------------------------------------------------------------------------------------------
+//--- DEG REPORTS
+//------------------------------------------------------------------------------------------------
+
+include "/mnt/projects/iamp/scripts/anduril/degTable.and"
+include "/mnt/projects/iamp/scripts/anduril/degBoxPlot.and"
+include "/mnt/projects/iamp/scripts/anduril/goClustering.and"
+include "/mnt/projects/iamp/scripts/anduril/goEnrichment.and"
+include "/mnt/projects/iamp/scripts/anduril/expressionHeatmap.and"
+
+degReportLst = record()
+degTables = record()
+for ID, group : comparisons 
+{	
+	//--- VOLCANO PLOT -----------------------------------------------------------------------------------------------------//
+
+	degVolcanoPlot = VolcanoPlot
+	(
+		expr = degAllLst[ID],
+		geneNames = geneNames,
+		sigthresh = qLimitInclude,
+		lfcthresh = fcLimitInclude,
+		labelsig = true,
+		sigthreshLabel = 1e-30,
+		lfcthreshLabel = 2,
+		cexLabel = 0.5,
+		sampleSize = 1000,
+		caption = "Scatter plot of log2 fold-changes vs. p-values (aka 'volcano plot') comparing gene expression between " + group.caseG + " and " + group.controlG + " samples.",
+		sectionTitle="Volcano plot " + ID,
+		sectionType="subsubsection",
+		@name = "degVolcanoPlot_" + ID
+	)
+
+	//--- PREPARE TABLE WITH DIFFERENTIALLY EXPRESSED GENES IN OUTPUT FORMAT ------------------------------------------------//
+	
+	degTable = TableQuery
+	(
+		table1 = degCalledLst[ID] @require,
+		table2 = geneNames        @require,
+		table3 = geneAnnot        @require,
+		query  = '''
+			SELECT G."ids"                        AS "Ensembl",
+			A."Gene"                              AS "Gene",
+			G."fc"                                AS "fc",
+			G."meanExprE"                         AS "exprA",
+			G."meanExprC"                         AS "exprB",
+			G."q"                                 AS "qValue",
+			CONCAT(D."Chromosome Name", D."Band") AS "Band",
+			D."Chromosome Name"                   AS "chr",
+			D."Gene Start (bp)"                   AS "start",
+			D."Gene End (bp)"                     AS "end",
+			SUBSTR(D."Description", 1, 65)        AS "Description",
+			CASEWHEN(G."fc" > 0, 1, -1)           AS "status"
+			FROM table1 G
+				LEFT OUTER JOIN table2 AS A ON (G."ids" = A."Ensembl")
+				LEFT OUTER JOIN table3 AS D ON (G."ids" = D."Ensembl Gene ID")
+			ORDER  BY "qValue", ABS("fc") DESC
+		''',
+		@name  = "degTable_"+ID
+	)
+
+	degTables[ID] = degTable  // we write them to an Excel file later
+
+	//--- TABLES WITH UP- AND DOWN-REULATED GENES --------------------------------------------------------------------------//
+
+	degTableUp = getDEGTableReport
+	(
+		degs = degTable,
+		degReportRefs = ensemblRef,
+		direction = "up",
+		group = group,
+		ID=ID,
+		section="Genes with higher expression in "+group.caseG+" than "+group.controlG+" samples",
+		sectionType="subsubsection",
+		@name = "degTableUp_"+ID
+	)
+
+	degTableDn = getDEGTableReport
+	(
+		degs = degTable,
+		degReportRefs = ensemblRef,
+		direction = "down",
+		group = group,
+		ID=ID,
+		section="Genes with lower expression in "+group.caseG+" than "+group.controlG+" samples",
+		sectionType="subsubsection",
+		@name = "degTableDn_"+ID
+	)
+
+	//--- BOX PLOTS TOP UP- AND DOWN-REGULATED GENES ----------------------------------------------------------------------//
+
+	degBoxplotUp = getDEGBoxPlots
+	(
+		degs = degTable,
+		exprMatrix = deseqExprMatrix.expr,
+		sampleGroupsSimple=sampleGroups,
+		geneAnnot=geneAnnot,
+		direction="up",
+		group=group,
+		groupOrder="kd-shG1-72h,kd-NT-72h,oe-ER-72h,oe-RHD-72h,oe-empty-72h",
+		labelOutliers=false,
+		sectionType="subsubsection",
+		@name = "degBoxplotUp_"+ID
+	)
+
+	degBoxplotDn = getDEGBoxPlots
+	(
+		degs = degTable,
+		exprMatrix = deseqExprMatrix.expr,
+		sampleGroupsSimple=sampleGroups,
+		geneAnnot=geneAnnot,
+		direction="down",
+		group=group,
+		groupOrder="kd-shG1-72h,kd-NT-72h,oe-ER-72h,oe-RHD-72h,oe-empty-72h",
+		labelOutliers=false,
+		sectionType="subsubsection",
+		@name = "degBoxplotDn_"+ID
+	)
+
+	//--- EXPRESSION HEATMAP --------------------------------------------------------------------------//
+
+	exprMatrixFiltered = CSVFilter
+	(
+		csv            = deseqExprMatrix.expr,
+		auxiliary      = degCalledLst[ID] @require,
+		includeColumns = group.sampleIdLst,
+		includeColumns = "RowName",
+		colOrder       = true,
+		@name          = "exprMatrix_"+ID
+	)                      
+
+	exprHeatmap = getHeatmapReport
+	(
+		exprMatrix = exprMatrixFiltered,
+		geneNames = geneNames,
+		group = group,
+		sectionType="subsubsection",
+		@name = "heatmap"+ID
+	)
+
+	//--- GO ENRICHMENT -------------------------------------------------------------------------------//
+
+	goEnrichment = getGOEnrichmentReport
+	(
+		geneIds      = degCalledLst[ID],
+		geneNames    = geneNames,
+		geneGO       = geneGO,
+		threshold    = pGOEnrich,
+		ID           = ID,
+		sectionTitle = "GO terms enriched in DEGs between " + group.caseG + " and " + group.controlG,
+		sectionType  = "subsubsection",
+		@name        = "goEnrichment"+ID
+	)
+
+	//--- GENE INTERACTION NETWORK --------------------------------------------------------------------//
+	
+	statusTable = TableQuery
+	(
+		table1   = degTables[ID] @require,
+		table2   = degAllLst[ID] @require,
+		query    = '''
+			SELECT "Ensembl", "status" FROM table1
+			UNION
+			SELECT T2."ids" AS "Ensembl", 1 AS "status"
+			FROM   table2 T2 LEFT JOIN table1 T1 ON T2."ids" = T1."Ensembl" 
+			WHERE  T1."Ensembl" IS NULL AND T2."meanExpr'''+ID+'''" >= 10 AND T2."q'''+ID+'''" < 0.01 AND T2."fc'''+ID+'''" >= 1
+			UNION
+			SELECT T2."ids" AS "Ensembl", -1 AS "status"
+			FROM   table2 T2 LEFT JOIN table1 T1 ON T2."ids" = T1."Ensembl" 
+			WHERE  T1."Ensembl" IS NULL AND T2."meanExpr'''+ID+'''" >= 10 AND T2."q'''+ID+'''" < 0.01 AND T2."fc'''+ID+'''" <= -1
+			UNION
+			SELECT T2."ids" AS "Ensembl", 0 AS "status"
+			FROM   table2 T2 LEFT JOIN table1 T1 ON T2."ids" = T1."Ensembl" 
+			WHERE  T1."Ensembl" IS NULL AND T2."meanExpr'''+ID+'''" >= 300 AND T2."q'''+ID+'''" >= 0.9 AND T2."fc'''+ID+'''" > -0.1 AND T2."fc'''+ID+'''" < 0.1
+			UNION
+			SELECT T2."ids" AS "Ensembl", -2 AS "status"
+			FROM   table2 T2 LEFT JOIN table1 T1 ON T2."ids" = T1."Ensembl" 
+			WHERE  T1."Ensembl" IS NULL AND T2."meanExpr'''+ID+'''" < 10
+            ''',
+		@name    = "statusTable_"+ID
+	)
+	
+    network = InteractionNetwork
+    (
+    	force genes  = degCalledLst[ID],
+		force status = statusTable,
+		moksiskaan   = moksiskaanInit.connection,
+		ensembl      = ensemblDb,
+		organism     = Organism_Homo_sapiens,
+		title        = "Interaction network of DEGs between " + group.caseG + " and " + group.controlG,
+		linkTypes    = std.concat(sep=",",
+			//LinkType_pathway_precedence,
+			//LinkType_protein_protein_interaction,
+			LinkType_chemical_reaction,
+			LinkType_protein_activation,
+			LinkType_protein_inhibition,
+			LinkType_protein_state_change,
+			LinkType_protein_binding,
+			LinkType_protein_dissociation,
+			LinkType_gene_expression,
+			LinkType_gene_repression,
+			LinkType_phosphorylation,
+			LinkType_dephosphorylation,
+			LinkType_glycosylation,
+			LinkType_ubiquitination,
+			LinkType_deubiquitination,
+			LinkType_methylation,
+			LinkType_demethylation,
+			LinkType_acetylation,
+			LinkType_deacetylation,
+			LinkType_sumoylation,
+			LinkType_desumoylation
+		),
+		annotRules        = "",
+		bioentityTypes    = BioentityType_gene,
+		maxGap            = 1,
+		cytoscape         = false,
+		useStudies        = "",
+		hideGaps          = false,
+		isolateGroupNames = false,
+		expand            = "connected",
+		statusFilter      = "NA",
+		sectionType       = "subsubsection",
+		@name             = "network_"+ID,
+		@enabled          = true
+	)
+	
+	//--- COMBINE REPORTS -----------------------------------------------------------------------------//
+
+	degReportLst[ID] = LatexCombiner
+	(
+		array = {
+			degVolcanoPlot.document,
+			degTableUp, 
+			degBoxplotUp,
+			degTableDn, 
+			degBoxplotDn, 
+			exprHeatmap, 
+			goEnrichment,
+			network.report
+		},
+		sectionTitle=ID, 
+		sectionType="subsection"
+	)
+}
+
+//------------------------------------------------------------------------------------------------
+//--- VENN DIAGRAM(S)
+//------------------------------------------------------------------------------------------------
+
+degSets = CSV2SetList(tables=degCalledLst)
+
+venn = VennDiagram
+(
+	sets         = degSets,
+	cexSetName   = 0.3,
+	cexSetSize   = 0.3,
+	doWeights    = true,
+	sets1        = "shG1vsNT,oeERvsEmpty,oeRHDvsEmpty",
+	sectionTitle = "Gene set comparisons",
+	sectionType  = "subsection",
+	types        = "circles"
+)
+
+degReportLst["venn"] = venn.report
+
+//------------------------------------------------------------------------------------------------
+//--- VENN SETS
+//------------------------------------------------------------------------------------------------
+
+include "venn.and"
+
+vennSetsExpanded = ExpandCollapse(relation=venn.sets)
+
+// --- intersection shG1vsNT and oeERvsEmpty
+
+vennSetTableReport_shG1vsNT_AND_oeERvsEmpty = VennSetTableReport
+(
+	vennSetData        = vennSetsExpanded,
+	vennSetNames       = {"shG1vsNT_AND_oeERvsEmpty_AND_oeRHDvsEmpty", "shG1vsNT_AND_oeERvsEmpty_AND_NOT_oeRHDvsEmpty"},
+	outputComparisons  = {"shG1vsNT", "oeERvsEmpty"},
+	degs               = degCalledLst,
+	geneAnnot          = geneAnnot,
+	section            = "Intersection shG1vsNT and oeERvsEmpty",
+	sectionType        = "subsubsection",
+	caption            = "These genes were found to be significantly differentially expressed in both " + comparisons["shG1vsNT"].desc + " (set 'A') and " + comparisons["oeERvsEmpty"].desc + " (set 'B'). " +
+	                     "Genes sorted by average q-value from most to least significant."
+)
+degReportLst["vennSetTableReport_shG1vsNT_AND_oeERvsEmpty"] = vennSetTableReport_shG1vsNT_AND_oeERvsEmpty.report
+
+// --- intersection shG1vsNT and oeRHDvsEmpty
+
+vennSetTableReport_shG1vsNT_AND_oeRHDvsEmpty = VennSetTableReport
+(
+	vennSetData        = vennSetsExpanded,
+	vennSetNames       = {"shG1vsNT_AND_oeERvsEmpty_AND_oeRHDvsEmpty", "shG1vsNT_AND_NOT_oeERvsEmpty_AND_oeRHDvsEmpty"},
+	outputComparisons  = {"shG1vsNT", "oeRHDvsEmpty"},
+	degs               = degCalledLst,
+	geneAnnot          = geneAnnot,
+	section            = "Intersection shG1vsNT and oeRHDvsEmpty",
+	sectionType        = "subsubsection",
+	caption            = "These genes were found to be significantly differentially expressed in both " + comparisons["shG1vsNT"].desc + " (set 'A') and " + comparisons["oeRHDvsEmpty"].desc + " (set 'B'). " +
+	                     "Genes sorted by average q-value from most to least significant."
+)
+degReportLst["vennSetTableReport_shG1vsNT_AND_oeRHDvsEmpty"] = vennSetTableReport_shG1vsNT_AND_oeRHDvsEmpty.report
+
+// --- intersection oeERvsEmpty and oeRHDvsEmpty
+
+vennSetTableReport_oeERvsEmpty_AND_oeRHDvsEmpty = VennSetTableReport
+(
+	vennSetData        = vennSetsExpanded,
+	vennSetNames       = {"shG1vsNT_AND_oeERvsEmpty_AND_oeRHDvsEmpty", "NOT_shG1vsNT_AND_oeERvsEmpty_AND_oeRHDvsEmpty"},
+	outputComparisons  = {"oeERvsEmpty", "oeRHDvsEmpty"},
+	degs               = degCalledLst,
+	geneAnnot          = geneAnnot,
+	section            = "Intersection oeERvsEmpty and oeRHDvsEmpty",
+	sectionType        = "subsubsection",
+	caption            = "These genes were found to be significantly differentially expressed in both " + comparisons["oeERvsEmpty"].desc + " (set 'A') and " + comparisons["oeRHDvsEmpty"].desc + " (set 'B'). " +
+	                     "Genes sorted by average q-value from most to least significant."
+)
+degReportLst["vennSetTableReport_oeERvsEmpty_AND_oeRHDvsEmpty"] = vennSetTableReport_oeERvsEmpty_AND_oeRHDvsEmpty.report
+
+// --- intersection shG1vsNT, oeERvsEmpty and oeRHDvsEmpty
+
+vennSetTableReport_shG1vsNT_AND_oeERvsEmpty_AND_oeRHDvsEmpty = VennSetTableReport
+(
+	vennSetData        = vennSetsExpanded,
+	vennSetNames       = {"shG1vsNT_AND_oeERvsEmpty_AND_oeRHDvsEmpty"},
+	outputComparisons  = {"shG1vsNT", "oeERvsEmpty", "oeRHDvsEmpty"},
+	degs               = degCalledLst,
+	geneAnnot          = geneAnnot,
+	section            = "Intersection shG1vsNT, oeERvsEmpty and oeRHDvsEmpty",
+	sectionType        = "subsubsection",
+	caption            = "These genes were found to be significantly differentially expressed in all three comparisons, including " + comparisons["shG1vsNT"].desc + " (set 'A'), " + 
+	                     comparisons["oeERvsEmpty"].desc + " (set 'B'), and " + comparisons["oeRHDvsEmpty"].desc + " (set 'C'). " +
+	                     "Genes sorted by average q-value from most to least significant."
+)
+degReportLst["vennSetTableReport_shG1vsNT_AND_oeERvsEmpty_AND_oeRHDvsEmpty"] = vennSetTableReport_shG1vsNT_AND_oeERvsEmpty_AND_oeRHDvsEmpty.report
+
+//------------------------------------------------------------------------------------------------
+//--- POSITIONAL GENE ENRICHMENT
+//------------------------------------------------------------------------------------------------
+
+include "/mnt/projects/iamp/scripts/anduril/pgeReport.and"
+
+pgeReportLst = record()
+for comparison : std.itercsv(inputComparisons) {
+	
+	pgeReportLst[comparison.ID] = PGEReport
+	(
+		query=degCalledLst[comparison.ID], 
+		reference=gtf, 
+		title=comparison.ID,
+		pvalue=0.01,
+		includeHeader=std.length(pgeReportLst)==0,
+		@name="pge_"+comparison.ID
+	)
+}
+	
+pgeReport = LatexCombiner
+(
+	array=pgeReportLst, 
+	pagebreak=true, 
+	sectionTitle="Positional gene enrichment (PGE) of differentially expressed genes", 
+	sectionType="section"
+)
+ 
+
+//------------------------------------------------------------------------------------------------
+//--- COMBINED REPORT
+//------------------------------------------------------------------------------------------------
+
+rConfig = RConfigurationReport(packages = "base,csbl.go,DESeq2,igraph", sectionType = "section")
+bibtexMoksiskaan = INPUT(path="/usr/local/share/anduril-bundles/moksiskaan/components/report-BibTeX/moksiskaan.bib")
+bibtexSequencing = INPUT(path="/usr/local/share/anduril-bundles/sequencing/components/report-BibTeX/sequencing.bib")
+
+docTemplate = LatexTemplate
+(
+	authors  = std.quote(authors, type="LaTeX"),
+	bibtex1  = rConfig.citations,
+	bibtex2  = bibtexMoksiskaan,
+	bibtex3  = bibtexSequencing,
+	title    = std.quote(title, type="LaTeX") + "\\newline Main Report",
+	printTOC = true
+)
+
+degReport = LatexCombiner
+(
+	array        = degReportLst,
+	pagebreak    = true,
+	tail         = '\newpage{}',
+	sectionTitle = "Differentially expressed genes"
+)
+
+combinedReport = LatexCombiner
+(
+	array={
+		experimentReport,
+		qcReport,
+		degReport,
+		pgeReport,
+		rConfig.report
+	}
+)
+
+combinedPDF = LatexPDF
+(
+	document = combinedReport,
+	header   = docTemplate.header,
+	footer   = docTemplate.footer,
+	useRefs  = true,
+	verbose  = false
+)
+
+@out.out.filename = shortName + "-main.pdf"
+OUTPUT(combinedPDF.document)
+
+//------------------------------------------------------------------------------------------------
+//--- GENE SET ENRICHMENT ANALYSIS (GSEA)
+//------------------------------------------------------------------------------------------------
+include "gsea.and"
+
+gseaMSigDBUp = record()
+gseaMSigDBDn = record()
+gseaDSigDBUp = record()
+gseaDSigDBDn = record()
+gseaGeneSigDBUp = record()
+gseaGeneSigDBDn = record()
+gseaTFTargetsUp = record()
+gseaTFTargetsDn = record()
+
+permutations = 1000
+
+gseaTableReportGroups = record()
+for ID, group : comparisons 
+{	
+	rnk = DEG2Rnk
+	(
+		deg = degAllLst[ID],
+		annotation = geneNames,
+		colP = "p" + ID,
+		colFC= "fc" + ID,
+		@name = "rnk_" + ID,
+		@enabled = true
+	)
+
+	// MSigDB
+	
+	gseaMSigDB = GSEA
+	(
+		rnk = rnk,
+		annotations = genesetAnnotation,
+		label = ID,
+		gmt   = "/mnt/projects/generic/data/msigdb5.0/c1.all.v5.0.symbols.gmt," + 
+		        "/mnt/projects/generic/data/msigdb5.0/c2.all.v5.0.symbols.gmt," + 
+		        "/mnt/projects/generic/data/msigdb5.0/c3.mir.v5.0.symbols.gmt," + 
+		        "/mnt/projects/generic/data/msigdb5.0/c5.all.v5.0.symbols.gmt," + 
+		        "/mnt/projects/generic/data/msigdb5.0/c6.all.v5.0.symbols.gmt," + 
+		        "/mnt/projects/generic/data/msigdb5.0/c7.all.v5.0.symbols.gmt," + 
+		        "/mnt/projects/generic/data/msigdb5.0/h.all.v5.0.symbols.gmt," +
+		        "/mnt/projects/generic/data/laurenti_2013_hematopoietic_lineages.gmt", 
+		options = "-nperm " + permutations + " -set_max 1000 -set_min 5",
+		@memory  = 7000,
+		@cpu     = 2, 			
+		@name = "gseaMSigDB_" + ID,
+		@enabled = true
+	)
+	gseaMSigDBUp[ID] = gseaMSigDB.enrichedUp
+	gseaMSigDBDn[ID] = gseaMSigDB.enrichedDown
+
+	// GeneSigDB
+
+	gseaGeneSigDB = GSEA
+	(
+		rnk = rnk,
+		annotations = genesetAnnotation,
+		label = ID,
+		gmt   = "/mnt/projects/generic/data/GeneSigDB/ALL_SIGSv4.nodup.gmt",
+		options = "-nperm " + permutations + " -set_max 1000 -set_min 5",
+		@memory  = 7000,
+		@cpu     = 2, 			
+		@name = "gseaGeneSigDB_" + ID,
+		@enabled = true
+	)
+	gseaGeneSigDBUp[ID] = gseaGeneSigDB.enrichedUp
+	gseaGeneSigDBDn[ID] = gseaGeneSigDB.enrichedDown
+	
+	// DSigDB
+
+	gseaDSigDB = GSEA
+	(
+		rnk = rnk,
+		annotations = genesetAnnotation,
+		label = ID,
+		gmt   = "/mnt/projects/generic/data/DSigDB/DSigDB_v1.0_All.nodup.gmt",
+		options = "-nperm " + permutations + " -set_max 1000 -set_min 3",
+		@memory  = 7000,
+		@cpu     = 2, 			
+		@name = "gseaDSigDB_" + ID,
+		@enabled = true
+	)
+	gseaDSigDBUp[ID] = gseaDSigDB.enrichedUp
+	gseaDSigDBDn[ID] = gseaDSigDB.enrichedDown
+
+	// Encode ChIP-seq TF target gene sets from UCSC: 	
+	// mysql --user=genome --host=genome-mysql.cse.ucsc.edu --database=hg19 --column-names=FALSE --connect-timeout=10000 -B -A -e "select TF, '' AS DESCRIPTION, GROUP_CONCAT(HGNC SEPARATOR ' ') AS HGNC from (select DISTINCT TF.name AS TF, X.geneSymbol AS HGNC from wgEncodeRegTfbsClusteredV3 as TF join knownGene as GENE on TF.chrom=GENE.chrom and TF.chromStart BETWEEN GENE.txStart-2000 and GENE.txStart+2000 join kgXref as X on GENE.name=X.kgID WHERE TF.score=1000 AND X.geneSymbol IS NOT NULL) AS RESULT GROUP BY TF;" | sed 's/ /\t/g' | perl -ne 's/^([^\t]+)/$1_ENCODE/; print $_' > /mnt/projects/iamp/data/anduril/encode_tf_chipseq.ucsc.hg19.gmt
+	
+	// JASPAR CORE target gene sets from oPOSSUM:
+	// perl /mnt/projects/iamp/scripts/opposum2gmt.pl
+	
+	gseaTFTargets = GSEA
+	(
+		rnk = rnk,
+		annotations = genesetAnnotation,
+		label = ID,
+		gmt   = "/mnt/projects/iamp/data/anduril/encode_tf_chipseq.ucsc.hg19.gmt," +
+		        "/mnt/projects/generic/data/pazar/pazar.gmt," +
+		        "/mnt/projects/generic/data/msigdb5.0/c3.tft.v5.0.symbols.gmt," +
+		        "/mnt/projects/generic/data/opossum3/jaspar_core.gmt",
+		options = "-nperm " + permutations + " -set_max 5000 -set_min 3",
+		@memory  = 7000,
+		@cpu     = 2, 			
+		@name = "gseaTFTargets_" + ID,
+		@enabled = true
+	)
+	gseaTFTargetsUp[ID] = gseaTFTargets.enrichedUp
+	gseaTFTargetsDn[ID] = gseaTFTargets.enrichedDown
+
+	gseaTableReportGroups[ID] = group
+}
+
+gseaReportMSigDB = getGSEAReportMSigDB
+(
+	enrichedUp = gseaMSigDBUp,
+	enrichedDn = gseaMSigDBDn,
+	tableReportGroups = gseaTableReportGroups,
+	minSetSize        = 10,
+	maxSetSize        = 1000,
+	@enabled = true
+)
+
+gseaReportHematologic = getGSEAReportHematologic
+(
+	enrichedUp = gseaMSigDBUp,
+	enrichedDn = gseaMSigDBDn,
+	tableReportGroups = gseaTableReportGroups,
+	minSetSize        = 10,
+	maxSetSize        = 1000,
+	@enabled = true
+)
+
+gseaReportGeneSigDB = getGSEAReportGeneSigDB
+(
+	enrichedUp        = gseaGeneSigDBUp,
+	enrichedDn 	      = gseaGeneSigDBDn,
+	tableReportGroups = gseaTableReportGroups,
+	minSetSize        = 5,
+	maxSetSize        = 1000,
+	@enabled = true
+)
+
+gseaReportTFTargets = getGSEAReportTFTargets
+(
+	enrichedUp = gseaTFTargetsUp,
+	enrichedDn = gseaTFTargetsDn,
+	tableReportGroups = gseaTableReportGroups,
+	minSetSize        = 10,
+	maxSetSize        = 5000,
+	@enabled = true
+)
+
+gseaReportDSigDB = getGSEAReportDSigDB
+(
+	enrichedUp = gseaDSigDBUp,
+	enrichedDn = gseaDSigDBDn,
+	tableReportGroups = gseaTableReportGroups,
+	minSetSize        = 3,
+	maxSetSize        = 1000,
+	@enabled = true
+)
+
+gseaReportOverlap = getGSEAOverlapReport
+(
+	enrichedMSigDBUp      = gseaMSigDBUp, 		enrichedMSigDBDn      = gseaMSigDBDn,
+	enrichedGeneSigDBUp   = gseaGeneSigDBUp,	enrichedGeneSigDBDn   = gseaGeneSigDBDn,
+	enrichedDSigDBUp      = gseaDSigDBUp,   	enrichedDSigDBDn 	  = gseaDSigDBDn,
+	enrichedTFTargetsUp   = gseaTFTargetsUp,    enrichedTFTargetsDn   = gseaTFTargetsDn,
+	groups 				  = gseaTableReportGroups,
+	similarityCutoffsTree = record(
+								shG1vsNTUp    = 0.2,  shG1vsNTDn = 0.3,
+								oeERvsEmptyUp = 0.2,  oeERvsEmptyDn = 0.2,
+								oeRHDvsEmptyUp = 0.2, oeRHDvsEmptyDn = 0.2,
+								oeERvsRHDUp   = 0.2,  oeERvsRHDDn  = 0.2
+							),
+	sigCutoffs 			  = record(
+								shG1vsNTUp    = 0.1,  shG1vsNTDn = 0.05,
+								oeERvsEmptyUp = 0.2,  oeERvsEmptyDn = 0.2,
+								oeRHDvsEmptyUp = 0.2, oeRHDvsEmptyDn = 0.2,
+								oeERvsRHDUp   = 0.2,  oeERvsRHDDn  = 0.2
+							),
+	maxRank = 500,
+	@enabled = true
+)
+
+combinedReportGsea = LatexCombiner
+(
+	array = {
+		gseaReportMSigDB,
+		gseaReportHematologic,
+		gseaReportGeneSigDB,
+		gseaReportTFTargets,
+		gseaReportDSigDB,
+		gseaReportOverlap
+	}
+)
+
+docTemplateGsea = LatexTemplate
+(
+	authors  = std.quote(authors, type="LaTeX"),
+	bibtex1  = rConfig.citations,
+	bibtex2  = bibtexSequencing,
+	title    = std.quote(title, type="LaTeX") + "\\newline GSEA Report",
+	printTOC = true
+)
+
+combinedPDFGsea = LatexPDF
+(
+	document = combinedReportGsea,
+	header   = docTemplateGsea.header,
+	footer   = docTemplateGsea.footer,
+	useRefs  = true,
+	verbose  = false
+)
+
+@out.out.filename = shortName + "-GSEA.pdf"
+OUTPUT(combinedPDFGsea.document)
+
+

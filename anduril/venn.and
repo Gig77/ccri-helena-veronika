@@ -1,0 +1,92 @@
+function VennSetTableReport
+(
+	CSV    vennSetData,
+	CSV    geneAnnot,
+	record vennSetNames,
+	record outputComparisons,
+	record degs,
+	string section,
+	string sectionType,
+	string caption
+) -> (Latex report)
+{
+	// collect input tables in record for TableQuery
+	
+	tables = record(vennSetData=vennSetData)
+	tables["geneAnnot"] = geneAnnot
+	for ID, comparison : outputComparisons	{ tables[comparison] = degs[comparison] }
+
+	// build SQL statement dynamically depending on input comparisons
+	
+	query = 'SELECT DISTINCT vennSetData."Members" AS "Ensembl", geneAnnot."Associated Gene Name" AS "Gene", '
+	for ID, comparison : outputComparisons	{ query = query + comparison + '."fc" AS "FC_' + comparison + '", ' + comparison + '."q" AS "q_' + comparison + '", ' }
+	query = query + 'SUBSTR(geneAnnot."Description", 1, 65)  AS "Description" '	
+
+	query = query + 'FROM vennSetData, geneAnnot'
+	for ID, comparison : outputComparisons	{ query = query + ', ' + comparison }
+
+	query = query + ' WHERE vennSetData."ID" IN ('
+	for ID, set : vennSetNames 
+	{
+		if (ID > 1) { query = query + ', ' }
+		query = query + "'" + set + "'"
+	}
+	query = query + ') AND vennSetData."Members" = geneAnnot."Ensembl Gene ID"' 
+	for ID, comparison : outputComparisons	{ query = query + ' AND vennSetData."Members" = ' + comparison + '."ids"' }
+
+	query = query + " ORDER BY ("
+	for ID, comparison : outputComparisons	
+	{ 
+		if (ID > 1) { query = query + '+' }
+		query = query + 'CASEWHEN("q_' + comparison + '"=0,-300,LOG("q_' + comparison + '"))'
+	}
+	query = query + ')/' + std.length(outputComparisons)
+	
+	std.echo(query)	
+	table = TableQuery
+	(
+		tables = tables,
+		query  = query
+	)
+	
+	// get table report
+	
+	columns = "Ensembl,Gene"
+	for ID, comparison : outputComparisons	{ columns = columns + ',FC_' + comparison + ',q_' + comparison }
+	columns = columns + ",Description"
+	
+	rename = "Description=Description"
+	syn = {"A", "B", "C", "D", "E", "F"}
+	for ID, comparison : outputComparisons	{ rename = rename + ',FC_' + comparison + '=fc(' + syn[ID] + '),q_' + comparison + '=q(' + syn[ID] + ')' }
+	
+	numberFormat = ""
+	for ID, comparison : outputComparisons	
+	{ 
+		if (numberFormat != "") { numberFormat = numberFormat + ',' }
+		numberFormat = numberFormat + 'FC_' + comparison + '=#0.0,q_' + comparison + '=#0.0E00'
+	}
+	
+	colFormat = "ll"
+	for ID, comparison : outputComparisons	{ colFormat = colFormat + 'rr' }
+	colFormat = colFormat + 'p{7.5cm}'
+	
+	tableReport = CSV2Latex
+	(
+		tabledata    = table,
+		refs         = hyperlinkRuleEnsemblGeneCards,
+		attach       = false,
+		columns      = columns,
+		rename       = rename,
+		numberFormat = numberFormat,
+		colFormat    = colFormat,
+		countRows    = true,
+		dropMissing  = false,
+		listCols     = "",
+		pageBreak    = false,
+		section      = section,
+		sectionType  = sectionType,
+		caption      = caption
+	)
+	
+	return tableReport.report
+}
