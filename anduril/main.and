@@ -36,7 +36,7 @@ hyperlinkRuleEnsemblGeneCards = StringInput(content=
 )
 
 //------------------------------------------------------------------------------------------------
-//--- PRE-PROCESSING OF INPUT DATA
+//--- PRELUDE
 //------------------------------------------------------------------------------------------------
 
 inputBamFiles = Folder2Array(folder1 = inputBamDir, filePattern = "^([^_]+)_.*[.]bam$")
@@ -56,7 +56,6 @@ for entry : std.itercsv(inputSamples)
 		'description' = entry.Description
 	}
 }
-std.echo(samples["29309"])
 
 //------------------------------------------------------------------------------------------------
 //--- SAMPLE GROUPS
@@ -354,9 +353,7 @@ for ID, group : comparisons
 		geneNames = geneNames,
 		sigthresh = qLimitInclude,
 		lfcthresh = fcLimitInclude,
-		labelsig = true,
-		sigthreshLabel = 1e-30,
-		lfcthreshLabel = 2,
+		labelTopN = 30,
 		cexLabel = 0.5,
 		sampleSize = 1000,
 		caption = "Scatter plot of log2 fold-changes vs. p-values (aka 'volcano plot') comparing gene expression between " + group.caseG + " and " + group.controlG + " samples.",
@@ -477,6 +474,7 @@ for ID, group : comparisons
 	goEnrichment = getGOEnrichmentReport
 	(
 		geneIds      = degCalledLst[ID],
+		deseq        = degAllLst[ID],    // used to correct background gene set using only actually measured genes
 		geneNames    = geneNames,
 		geneGO       = geneGO,
 		threshold    = pGOEnrich,
@@ -748,6 +746,29 @@ combinedPDF = LatexPDF
 
 @out.out.filename = shortName + "-main.pdf"
 OUTPUT(combinedPDF.document)
+
+//------------------------------------------------------------------------------------------------
+//--- EXCEL FILES WITH DIFFERENTIALLY EXPRESSED GENES
+//------------------------------------------------------------------------------------------------
+
+include "/mnt/projects/iamp/scripts/anduril/degExcel.and"
+
+degExcel = degExcelOutput
+(
+	degTables   = degTables,
+	degAllLst   = degAllLst,
+	linkRule    = ensemblRef,
+	geneNames   = geneNames,
+	geneAnnot   = geneAnnot,
+	comparisons  = comparisons,
+	fdrCutoff    = 1
+)
+	
+@out.out.filename = shortName + "-DE-genes.xls"
+OUTPUT(degExcel.degs)
+
+@out.out.filename = shortName + "-all-genes.xls"
+OUTPUT(degExcel.allGenes)
 
 //------------------------------------------------------------------------------------------------
 //--- GENE SET ENRICHMENT ANALYSIS (GSEA)
