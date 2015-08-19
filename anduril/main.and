@@ -128,7 +128,8 @@ experimentReport = experimentalSetupReport
 alignedBams = record()
 for bam : std.iterArray(inputBamFiles) 
 {
-	@out.alignment.filename = bam.key + '.gsnap.sorted.dupmarked.bam'
+	alias = samples[bam.key+""].alias
+	@out.alignment.filename = alias + '.gsnap.sorted.dupmarked.bam'
 	gsnap = GSNAP
 	(
 		reads    = INPUT(path=bam.file), 
@@ -136,10 +137,9 @@ for bam : std.iterArray(inputBamFiles)
 		docker   = "biowaste:5000/anduril/gsnap",
 		@cpu     = 10, 
 		@memory  = 40000,
-		@name    = "gsnap_" + bam.key,
+		@name    = "gsnap_" + alias,
 		@execute = "once" 
 	)
-	alias = samples[bam.key+""].alias
 	alignedBams[alias] = gsnap.alignment
 }
 
@@ -295,11 +295,12 @@ for ID, comparison : comparisons
 {
 	deseq = DESeq2
 	(
-		countFiles              = bamCounts,
-		samples                 = sampleGroups,
-	    nameControl             = comparison.controlG,
-	    nameCase                = comparison.caseG,
-	    additionalGroups        = comparison.addG,
+		samples                 = inputSamples,
+		sampleGroups            = inputSampleGroups,
+		counts                  = bamCounts,
+	    controlGroup            = comparison.controlG,
+	    caseGroup               = comparison.caseG,
+	    otherGroups             = comparison.addG,
 	    label                   = ID,
 	    minReplicatesForReplace = 7,
 	    @name                   = "deseq_" + ID
