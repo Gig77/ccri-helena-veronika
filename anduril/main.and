@@ -532,7 +532,7 @@ for ID, comparison : comparisons
 	(
 		exprMatrix = exprMatrixFiltered,
 		geneNames = geneNames,
-		group = comparison,
+		comparison = comparison,
 		sectionType="subsubsection",
 		@name = "heatmap" + std.quote(ID, type="Anduril")
 	)
